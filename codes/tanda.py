@@ -308,7 +308,7 @@ model = nn.DataParallel(model)
 optimizer = Adam(model.parameters(), lr=transfer_learning_rate)
 
 train_loss = train_epochs_asnq(transfer_epochs, asnq_train_dl, model, optimizer, criterion, 
-                               dev_dataloader=asnq_dev_dl, eval_steps=100, save_path='best-transfer-roberta.pth', 
+                               dev_dataloader=asnq_dev_dl, eval_steps=10000, save_path='best-transfer-roberta.pth', 
                                device=DEVICE)
 print('Transfer complete. Train loss:', train_loss)
 
