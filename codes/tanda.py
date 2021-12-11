@@ -11,6 +11,7 @@ import copy
 import datasets
 import numpy as np
 import matplotlib.pyplot as plt
+from sklearn.metrics import average_precision_score
 
 import torch
 from torch import nn
@@ -18,7 +19,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
 
 import transformers
-from transformers import BertTokenizer, BertModel
+from transformers import RobertaTokenizer, RobertaModel
 
 transformers.logging.set_verbosity_error()
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -47,12 +48,13 @@ class AS2Dataset(Dataset):
             str.maketrans('', '', string.punctuation)).lower().strip()
         sentence = sample[self.sentence_key].translate(
             str.maketrans('', '', string.punctuation)).lower().strip()
-        label = sample['label'] * 1.0
+        label = torch.zeros(2)
+        label[sample['label']] = 1.0
         
         input_enc = tokenizer(text=question, text_pair=sentence, 
                               add_special_tokens=True, truncation=True, padding='max_length', 
                               max_length=self.max_length, 
-                              return_tensors='pt', return_attention_mask=True)
+                              return_tensors='pt', return_attention_mask=True, return_token_type_ids=True)
         
         if self.name == 'wikiqa':
             return (sample['question_id'], question, sentence, 
@@ -70,7 +72,7 @@ class TandaTransfer(nn.Module):
         super(TandaTransfer, self).__init__()
         self.encoder = encoder
         self.layers = nn.Sequential(
-            nn.Linear(768, 1),
+            nn.Linear(768, 2),
             nn.Dropout(p=0.25)
         )
         
@@ -81,8 +83,8 @@ class TandaTransfer(nn.Module):
         x = self.layers(x)
         
         return x
-
-
+    
+    
 class BertQA(nn.Module):
     def __init__(self, encoder):
         super(BertQA, self).__init__()
@@ -91,7 +93,7 @@ class BertQA(nn.Module):
             nn.Linear(768, 512),
             nn.Dropout(p=0.25),
             nn.LeakyReLU(negative_slope=0.2),
-            nn.Linear(512, 1),
+            nn.Linear(512, 2),
             nn.Dropout(p=0.15),
         )
         
@@ -102,8 +104,8 @@ class BertQA(nn.Module):
         x = self.layers(x)
         
         return x
-
-
+    
+    
 def get_valid_questions(wikiqa):
     question_status = dict()
 
@@ -137,14 +139,13 @@ def train_epochs_asnq(n_epochs, dataloader, model, optimizer, criterion,
             sample = [s.to(device) for s in sample]
             optimizer.zero_grad()
             output = model(sample[:-1])
-            loss = criterion(output.flatten(), sample[-1].flatten())
+            loss = criterion(output, sample[-1])
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
             if step > 0 and step % eval_steps == 0:
                 dev_loss = validate_asnq(dev_dataloader, model, criterion, device=device)
-                print(f'Epoch {epoch+1} step {step}: dev loss: {dev_loss:.4f}')
                 if dev_loss < best_loss:
                     best_loss = dev_loss
                     save_dict = {
@@ -154,7 +155,7 @@ def train_epochs_asnq(n_epochs, dataloader, model, optimizer, criterion,
                         'model_params': model.state_dict()
                     }
                     torch.save(save_dict, save_path)
-                    print(f'Best checkpoint saved, dev loss: {dev_loss:.4f}')
+                    print(f'Best checkpoint saved at epoch {epoch+1}, step {step}, dev loss: {dev_loss:.4f}')
                 step_loss = 0.0
         
         save_dict = {
@@ -163,7 +164,7 @@ def train_epochs_asnq(n_epochs, dataloader, model, optimizer, criterion,
                     'dev_loss': dev_loss,
                     'model_params': model.state_dict()
                     }
-        torch.save(save_dict, 'final-transfer.pth')
+        torch.save(save_dict, 'final-transfer-roberta.pth')
         total_loss /= n_batches
         print(f'Epoch {epoch+1} complete. Train loss: {total_loss:.4f}')
     
@@ -179,7 +180,7 @@ def validate_asnq(dataloader, model, criterion, device='cpu'):
         sample = sample[2:6]
         sample = [s.to(device) for s in sample]
         output = model(sample[:-1])
-        loss = criterion(output.flatten(), sample[-1].flatten())
+        loss = criterion(output, sample[-1])
         total_loss += loss.item()
         
     return total_loss / n_batches
@@ -195,7 +196,7 @@ def train_epoch(dataloader, model, optimizer, criterion, device='cpu'):
         sample = [s.to(device) for s in sample]
         optimizer.zero_grad()
         output = model(sample[:-1])
-        loss = criterion(output.flatten(), sample[-1].flatten())
+        loss = criterion(output, sample[-1])
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
@@ -212,7 +213,7 @@ def validate(dataloader, model, criterion, device='cpu'):
         sample = sample[3:7]
         sample = [s.to(device) for s in sample]
         output = model(sample[:-1])
-        loss = criterion(output.flatten(), sample[-1].flatten())
+        loss = criterion(output, sample[-1])
         total_loss += loss.item()
         
     return total_loss / n_batches
@@ -223,12 +224,13 @@ def get_scores(dataloader, model, device='cpu'):
     eval_results = list()
     
     for batch in dataloader:
+        batch = copy.deepcopy(batch)
         batch_d = [b.to(device) for b in batch[3:6]]
-        output = model(batch_d).detach()
+        output = model(batch_d).detach()[:, 1]
         scores = nn.Sigmoid()(output)
         
-        batch[-1] = batch[-1].tolist()
-        batch.append(scores.flatten().tolist())
+        batch[-1] = batch[-1][:, 1].tolist()
+        batch.append(scores.tolist())
         size = len(batch[0])
         eval_results.extend([[b[i] for b in batch] for i in range(size)])
         
@@ -252,51 +254,46 @@ def get_question_label_scores(results):
 
 def calculate_metrics(question_scores):
     total = len(question_scores) * 1.0
-    thresholds = np.arange(10, 20) / 20
     accuracy = 0
     mrr = 0.0
-    mean_ap = dict()
+    all_labels = list()
+    all_scores = list()
     
     for qid, values in question_scores.items():
+        values = copy.deepcopy(values)
         labels = values[2]
         scores = values[3]
+        all_labels.extend(labels)
+        all_scores.extend(scores)
         actual = np.array(labels).argmax()
         predicted = np.array(scores).argmax()
         expected_max = scores[actual]
         scores.sort(reverse=True)
         given_rank = scores.index(expected_max) + 1
         
-        for t in thresholds:
-            tp = np.sum(scores[actual] > t)
-            tp_fp = np.sum(np.array(scores) > t)
-            p = 1.0 if tp_fp == 0 else tp/tp_fp
-            if t in mean_ap:
-                mean_ap[t] += p / total
-            else:
-                mean_ap[t] = 0.0
-        
         if actual == predicted:
             accuracy += 1
         mrr += (1.0/given_rank)
         
     accuracy /= total
-    mean_ap = np.array(list(mean_ap.values())).mean()
+    mean_ap = average_precision_score(all_labels, all_scores)
     mrr /= total
     
     return accuracy, mean_ap, mrr
 
 
 asnq_f = datasets.load_from_disk('asnq-2-3')
-print('Loaded filtered ASNQ dataset:', asnq_f)
+print('Loaded filtered ASNQ:', asnq_f)
 
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-encoder = BertModel.from_pretrained('bert-base-uncased')
+tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+encoder = RobertaModel.from_pretrained('roberta-base')
 
 batch_size = 16 * 3
 transfer_epochs = 2
 transfer_learning_rate = 1e-6
 
-criterion = nn.BCEWithLogitsLoss()
+pos_weight=torch.tensor([1.0, 16.0], dtype=torch.float).to(DEVICE)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 asnq_train_ds = AS2Dataset(asnq_f['train'], 'asnq', tokenizer, max_length=128)
 asnq_dev_ds = AS2Dataset(asnq_f['validation'], 'asnq', tokenizer, max_length=128)
@@ -311,25 +308,27 @@ model = nn.DataParallel(model)
 optimizer = Adam(model.parameters(), lr=transfer_learning_rate)
 
 train_loss = train_epochs_asnq(transfer_epochs, asnq_train_dl, model, optimizer, criterion, 
-                               dev_dataloader=asnq_dev_dl, eval_steps=10000, save_path='best-transfer.pth', 
+                               dev_dataloader=asnq_dev_dl, eval_steps=100, save_path='best-transfer-roberta.pth', 
                                device=DEVICE)
+print('Transfer complete. Train loss:', train_loss)
 
 model = TandaTransfer(encoder)
-save_dict = torch.load('best-transfer.pth')
+save_dict = torch.load('best-transfer-roberta.pth')
 model.load_state_dict(save_dict['model_params'], strict=False)
 
 wikiqa = datasets.load_dataset('wiki_qa')
 valid_questions = get_valid_questions(wikiqa)
 wikiqa_f = wikiqa.filter(lambda sample: sample['question_id'] in valid_questions)
-
-print('Loaded & filtered WikiQA for valid questions:', wikiqa_f)
+print('Filtered wikiqa:', wikiqa_f)
 
 adapt_learning_rate = 5e-6
 adapt_epochs = 10
 
-criterion = nn.BCEWithLogitsLoss()
+pos_weight=torch.tensor([1.0, 8.0], dtype=torch.float).to(DEVICE)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 model = BertQA(model.encoder)
+model = nn.DataParallel(model)
 model.to(DEVICE)
 
 optimizer = Adam(model.parameters(), lr=adapt_learning_rate, betas=(0.9, 0.999), eps=1e-7)
@@ -375,21 +374,19 @@ save_dict = {'model_params': best_model.state_dict(),
              'train_stats': train_stats, 
              'dev_stats': dev_stats
             }
-torch.save(save_dict, 'best-wikiqa-adapt.pth')
+torch.save(save_dict, 'best-wikiqa-adapt-roberta.pth')
 
-save_dict = torch.load('best-wikiqa-adapt.pth')
+save_dict = torch.load('best-wikiqa-adapt-roberta.pth')
 train_stats = save_dict['train_stats']
 dev_stats = save_dict['dev_stats']
 
 model = BertQA(encoder)
-model = nn.DataParallel(model)
-model.load_state_dict(save_dict['model_params'])
+model.load_state_dict(save_dict['model_params'], strict=False)
 model.to(DEVICE)
 
 test_loss = validate(wikiqa_test_dl, model, criterion, device=DEVICE)
-
 test_results = get_scores(wikiqa_test_dl, model, device=DEVICE)
 test_qscores = get_question_label_scores(test_results)
 test_acc, test_map, test_mrr = calculate_metrics(test_qscores)
 
-print(f'Test data: Accuracy = {test_acc}, MAP = {test_map}, MRR = {test_mrr}')
+print(f'Test data: Loss = {test_loss}, Accuracy = {test_acc}, MAP = {test_map}, MRR = {test_mrr}')
